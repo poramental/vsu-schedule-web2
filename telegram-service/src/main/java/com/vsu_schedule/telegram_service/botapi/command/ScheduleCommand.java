@@ -1,16 +1,15 @@
 package com.vsu_schedule.telegram_service.botapi.command;
 
-import org.telegram.telegrambots.meta.api.objects.commands.BotCommand;
+import com.vsu_schedule.telegram_service.botapi.annotation.botcommand.BotCommand;
 import org.telegram.telegrambots.meta.api.objects.message.Message;
 
-public class ScheduleCommand extends BotCommand implements Command {
 
-    private static final String command = "/schedule";
-    private static final String description = "расписание";
+@BotCommand(
+        commandName = "/schedule",
+        description = "расписание"
+)
+public class ScheduleCommand implements Command {
 
-    public ScheduleCommand() {
-        super(command,description);
-    }
 
     public String getAnswer(Message message) {
         return "Здравствуйте,"+message.getFrom().getFirstName()+"!\n"
@@ -18,6 +17,6 @@ public class ScheduleCommand extends BotCommand implements Command {
     }
 
     public static String getCommandName(){
-        return command;
+        return "/schedule";
     }
 }

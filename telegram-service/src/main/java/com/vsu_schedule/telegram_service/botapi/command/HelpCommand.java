@@ -1,16 +1,15 @@
 package com.vsu_schedule.telegram_service.botapi.command;
 
-import org.telegram.telegrambots.meta.api.objects.commands.BotCommand;
+import com.vsu_schedule.telegram_service.botapi.annotation.botcommand.BotCommand;
 import org.telegram.telegrambots.meta.api.objects.message.Message;
 
-public class HelpCommand extends BotCommand implements Command {
+@BotCommand(
+    commandName = "/help",
+    description = "Помощь"
+)
+public class HelpCommand implements Command {
 
-    private static final String command = "/help";
-    private static final String description = "Помощь";
 
-    public HelpCommand() {
-        super(command,description);
-    }
 
     public String getAnswer(Message message) {
         return "Вот список доступных:\n" +
@@ -22,7 +21,7 @@ public class HelpCommand extends BotCommand implements Command {
     }
 
     public static String getCommandName() {
-        return command;
+        return "/help";
     }
 
 }

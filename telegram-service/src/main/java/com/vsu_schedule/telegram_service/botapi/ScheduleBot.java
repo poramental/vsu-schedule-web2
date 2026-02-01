@@ -55,22 +55,11 @@ public class ScheduleBot implements SpringLongPollingBot, LongPollingSingleThrea
 
     private final BotConfig botConfig;
 
-    private final TelegramClient telegramClient;
+    @Autowired
+    private TelegramClient telegramClient;
 
     public ScheduleBot(BotConfig botConfig) {
         this.botConfig = botConfig;
-        this.telegramClient = new OkHttpTelegramClient(botConfig.getBotToken());
-        Collections.addAll(botCommandList,
-                new StartCommand(),
-                new HelpCommand(),
-                new RegisterCommand(),
-                new ScheduleCommand()
-        );
-        try {
-            telegramClient.execute(new SetMyCommands(botCommandList, new BotCommandScopeDefault(), null));
-        } catch (TelegramApiException e) {
-            log.error(e.getMessage());
-        }
     }
 
     @EventListener

@@ -1,6 +1,7 @@
 package com.vsu_schedule.telegram_service.botapi.service;
 
 
+import com.vsu_schedule.telegram_service.botapi.annotation.botcommand.handler.CommandHandler;
 import com.vsu_schedule.telegram_service.botapi.callback_query_types.FacultyCallbackQueryTypes;
 import com.vsu_schedule.telegram_service.botapi.callback_query_types.ResetRegistrationCallbackQueryTypes;
 import com.vsu_schedule.telegram_service.botapi.command.*;
@@ -33,15 +34,20 @@ public class BotMessageCommandService {
 
     private final LessonFeignClient lessonFeignClient;
 
+
+    @CommandHandler(StartCommand.class)
     public BotApiMethod<?> handleStartCommand(Message message){
         String chatId = message.getChatId().toString();
         return new SendMessage(chatId,new StartCommand().getAnswer(message));
     }
 
+    @CommandHandler(HelpCommand.class)
     public BotApiMethod<?> handleHelpCommand(Message message) {
         return new SendMessage(message.getChatId().toString(),new HelpCommand().getAnswer(message));
     }
 
+
+    @CommandHandler(RegisterCommand.class)
     public BotApiMethod<?> handleRegisterCommand(Message message){
         String chatId = message.getChatId().toString();
         if(!botUserRepository.existsByTelegramId(message.getFrom().getId())){
@@ -60,6 +66,7 @@ public class BotMessageCommandService {
         }
     }
 
+    @CommandHandler(ScheduleCommand.class)
     public BotApiMethod<?> handleScheduleCommand(Message message) {
         String chatId = message.getChatId().toString();
         Optional<BotUser> opt_user = botUserRepository.findByTelegramId(message.getFrom().getId());

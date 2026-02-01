@@ -1,7 +1,8 @@
-package com.vsu_schedule.telegram_service.commandchain;
+package com.vsu_schedule.telegram_service.command_strategy;
 
 import com.vsu_schedule.telegram_service.botapi.annotation.chatstate.ClearChatState;
 import lombok.NoArgsConstructor;
+import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.meta.api.methods.botapimethods.BotApiMethod;
 import org.telegram.telegrambots.meta.api.objects.message.Message;
 
@@ -9,11 +10,11 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Function;
 
-
+@Component
 @NoArgsConstructor
 public class TelegramCommandStrategyImpl implements TelegramCommandStrategy{
 
-    private final Map<String, Function<Message, BotApiMethod<?>>> map = new HashMap<>();
+    private final Map<String, Function<Message, BotApiMethod<?>>> routes = new HashMap<>();
 
     private String command = "";
 
@@ -24,8 +25,8 @@ public class TelegramCommandStrategyImpl implements TelegramCommandStrategy{
     }
 
     @Override
-    public TelegramCommandStrategy setCallback(Function<Message, BotApiMethod<?>> callback) {
-        map.put(command, callback);
+    public TelegramCommandStrategy setHandler(Function<Message, BotApiMethod<?>> callback) {
+        routes.put(command, callback);
         return this;
     }
 
@@ -33,8 +34,8 @@ public class TelegramCommandStrategyImpl implements TelegramCommandStrategy{
     @ClearChatState
     public BotApiMethod<?> handleMessageCommand(Message message) {
         String botCommand = message.getText();
-        if(map.get(botCommand) != null) {
-            return map.get(botCommand).apply(message);
+        if(routes.get(botCommand) != null) {
+            return routes.get(botCommand).apply(message);
         } return null;
     }
 

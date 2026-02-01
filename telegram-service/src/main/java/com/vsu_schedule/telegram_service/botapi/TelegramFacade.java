@@ -1,7 +1,7 @@
 package com.vsu_schedule.telegram_service.botapi;
 
 import com.vsu_schedule.telegram_service.botapi.handler.BotCallbackQueryHandler;
-import com.vsu_schedule.telegram_service.commandchain.TelegramCommandStrategy;
+import com.vsu_schedule.telegram_service.command_strategy.TelegramCommandStrategy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
