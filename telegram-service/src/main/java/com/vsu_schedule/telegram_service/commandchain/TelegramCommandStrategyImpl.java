@@ -1,10 +1,7 @@
 package com.vsu_schedule.telegram_service.commandchain;
 
-import com.vsu_schedule.telegram_service.botapi.cache.LastMessageIdCache;
-import com.vsu_schedule.telegram_service.botapi.cache.SendPhotoMessageIdCache;
-import com.vsu_schedule.telegram_service.botapi.cache.TeacherSessionStore;
+import com.vsu_schedule.telegram_service.botapi.annotation.chatstate.ClearChatState;
 import lombok.NoArgsConstructor;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.telegram.telegrambots.meta.api.methods.botapimethods.BotApiMethod;
 import org.telegram.telegrambots.meta.api.objects.message.Message;
 
@@ -17,15 +14,6 @@ import java.util.function.Function;
 public class TelegramCommandStrategyImpl implements TelegramCommandStrategy{
 
     private final Map<String, Function<Message, BotApiMethod<?>>> map = new HashMap<>();
-
-    @Autowired
-    private LastMessageIdCache lastMessageIdCache;
-
-    @Autowired
-    private SendPhotoMessageIdCache sendPhotoMessageIdCache;
-
-    @Autowired
-    private TeacherSessionStore teacherSessionStore;
 
     private String command = "";
 
@@ -42,13 +30,9 @@ public class TelegramCommandStrategyImpl implements TelegramCommandStrategy{
     }
 
     @Override
+    @ClearChatState
     public BotApiMethod<?> handleMessageCommand(Message message) {
         String botCommand = message.getText();
-        if(teacherSessionStore.get(message.getFrom().getId()) != null) {
-            teacherSessionStore.remove(message.getFrom().getId());
-        }
-        lastMessageIdCache.deleteLastMessageKeyboard(message.getChatId());
-        sendPhotoMessageIdCache.deleteLastSendPhotoMessage(message.getChatId());
         if(map.get(botCommand) != null) {
             return map.get(botCommand).apply(message);
         } return null;
