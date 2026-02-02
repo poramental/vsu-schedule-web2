@@ -6,28 +6,8 @@ const body = document.querySelector("body"),
       submitBtn = document.getElementById("submit_button")
 
 logoutBtn.onclick = function () {
-    var myHeaders = new Headers();
-    myHeaders.append("Content-Type", "application/json");
-    myHeaders.append("Cookie", "JSESSIONID=C9A5B398E23E08EBC2392F912302C741");
-
-let files = "";
-
-    var requestOptions = {
-      method: 'GET',
-      headers: myHeaders,
-      redirect: 'follow'
-    };
-
-    fetch("http://127.0.0.1:8765/schedule/auth/logout", requestOptions)
-      .then(response => response.text())
-      .then(result => {
-            localStorage.removeItem("token");
-            window.location.href = "/schedule/login";
-
-
-            })
-
-      .catch(error => console.log('error', error));
+    let files = "";
+     window.location.href = "/logout";
 }
 
 submitBtn.onclick = function () {

@@ -2,6 +2,8 @@ server:
   port: 9898
 
 spring:
+  config:
+    import: "optional:file:secrets.yaml"
   datasource:
     url: jdbc:postgresql://localhost:5432/schedule-db
     username: admin
@@ -12,6 +14,23 @@ spring:
       ddl-auto: none
   application:
     name: schedule-service
+  security:
+    oauth2:
+      client:
+        registration:
+          keycloak:
+            client-id: schedule-service
+            client-secret:
+            authorization-grant-type: authorization_code
+        provider:
+          keycloak:
+            issuer-uri: http://localhost:8080/realms/vsu-realm
+            user-name-attribute: preferred_username
+      resourceserver:
+        jwt:
+          issuer-uri: http://localhost:8080/realms/vsu-realm
+          jwk-set-uri: http://localhost:8080/realms/vsu-realm/protocol/openid-connect/certs
+
 
 
 eureka:
