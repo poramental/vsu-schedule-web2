@@ -3,7 +3,6 @@ package com.vsu_schedule.telegram_service.botapi.annotation.bpp;
 import com.vsu_schedule.telegram_service.botapi.annotation.botcommand.BotCommand;
 import com.vsu_schedule.telegram_service.botapi.annotation.botcommand.handler.CommandHandler;
 import com.vsu_schedule.telegram_service.command_strategy.TelegramCommandStrategy;
-import lombok.Getter;
 import org.jetbrains.annotations.NotNull;
 import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.context.event.ContextRefreshedEvent;
@@ -12,7 +11,6 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.ReflectionUtils;
 import org.telegram.telegrambots.meta.api.methods.botapimethods.BotApiMethod;
 import org.telegram.telegrambots.meta.api.methods.commands.SetMyCommands;
-import org.telegram.telegrambots.meta.api.objects.message.Message;
 import org.telegram.telegrambots.meta.generics.TelegramClient;
 
 import java.lang.reflect.Method;
@@ -20,14 +18,12 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Function;
 
 @Component
 public class BotCommandBeanPostProcessor implements BeanPostProcessor {
 
     private final TelegramCommandStrategy strategy;
     private final TelegramClient telegramClient;
-    // Временные хранилища для связки
     private final Map<Class<?>, String> classToCommandName = new HashMap<>();
     private final List<org.telegram.telegrambots.meta.api.objects.commands.BotCommand> telegramMeta = new ArrayList<>();
     private final Map<Class<?>, HandlerInfo> pendingHandlers = new HashMap<>();
@@ -63,7 +59,6 @@ public class BotCommandBeanPostProcessor implements BeanPostProcessor {
 
     @EventListener(ContextRefreshedEvent.class)
     public void onApplicationEvent() {
-        // 3. Связываем стратегию
         pendingHandlers.forEach((cmdClass, info) -> {
             String name = classToCommandName.get(cmdClass);
             if (name != null) {
@@ -78,7 +73,6 @@ public class BotCommandBeanPostProcessor implements BeanPostProcessor {
             }
         });
 
-        // 4. Регистрация в Telegram
         if (!telegramMeta.isEmpty()) {
             try {
                 telegramClient.execute(new SetMyCommands(telegramMeta));

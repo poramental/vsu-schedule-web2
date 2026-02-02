@@ -33,3 +33,24 @@ services:
     networks:
       - vsu-schedule-network
 
+
+  keycloak:
+    container_name: keycloak
+    image: quay.io/keycloak/keycloak:23.0.0
+    command: start-dev
+    ports:
+      - '8080:8080'
+    networks:
+      - vsu-schedule-network
+    environment:
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://db:5432/keycloak-db
+      - KC_DB_USERNAME=admin
+      - KC_DB_PASSWORD=admin
+      - KC_DB_SCHEMA=public
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=admin
+      - KC_HOSTNAME_STRICT=false
+      - KC_HTTP_ENABLED=true
+    depends_on:
+      - db

@@ -1,428 +1,796 @@
 package com.vsuscheduleweb.parser;
 
 import com.vsuscheduleweb.Exceptions.ParserException;
-import lombok.NoArgsConstructor;
-import org.apache.poi.ss.usermodel.Cell;
-import org.apache.poi.ss.usermodel.Sheet;
-import org.apache.poi.ss.usermodel.Workbook;
-import org.apache.poi.ss.usermodel.WorkbookFactory;
 import com.vsuscheduleweb.entity.*;
+import lombok.NoArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.poi.ss.usermodel.*;
 import org.springframework.stereotype.Component;
 
 import java.io.File;
 import java.util.*;
 import java.util.stream.Collectors;
 
-
+/**
+ * Excel расписание → доменные сущности (Group/Subgroup/Lesson/Teacher).
+ *
+ * ⚠️ ВАЖНО:
+ * 1) Этот парсер исторически "заточен" под конкретный шаблон Excel (границы, индексы колонок/строк).
+ * 2) Мы сохраняем исходную работоспособность/логику (поведение), но делаем код устойчивее:
+ *    - убираем опасные мутации Workbook/Cell,
+ *    - добавляем защиту от выхода за границы,
+ *    - исправляем баг с преподавателями (не добавлялись в список при множественных),
+ *    - уменьшаем дубликаты преподавателей,
+ *    - делаем потокобезопасность на уровне parse() (synchronized),
+ *    - улучшаем читаемость и комментируем "почему так", а не "что делает строка".
+ */
+@Slf4j
 @NoArgsConstructor
 @Component
-public  class Parser {
+public class Parser {
 
+    /**
+     * Эти коллекции оставлены как "выходной результат" для совместимости с существующим кодом
+     * (у тебя есть getters). Внутри parse() мы парсим в локальные структуры и в конце
+     * атомарно заменяем ссылки, чтобы не оставлять объект в "полупромежуточном" состоянии.
+     *
+     * parse() сделан synchronized: Spring Component по умолчанию singleton, иначе есть race-condition.
+     */
     private List<Teacher> teachers = new ArrayList<>();
     private List<Group> groups = new ArrayList<>();
-
     private List<Lesson> lessons = new ArrayList<>();
+
     private ParserStage parsMode;
 
-    public List<Teacher> getTeachers() {
-        for(int i = 0; i < teachers.size(); i++){
-            teachers.get(i).getLessons().removeIf(lesson -> lesson.getName().equals(""));
-        }
-        return teachers;
+    // ----------------------------
+    // Константы "магии" — чтобы было понятно, что это за числа и где менять
+    // ----------------------------
 
+    /** Строки выше этой считаем "шапкой" и игнорируем (по исходной логике было < 12). */
+    private static final int FIRST_DATA_ROW_INDEX = 12;
+
+    /** Колонка, с которой начинается область расписания (по исходной логике постоянно сравнивалось с 3). */
+    private static final int FIRST_SCHEDULE_COLUMN_INDEX = 3;
+
+    /**
+     * Порог границы, который используется как "разделитель секций".
+     * В оригинале было >3 и иногда ==5.
+     *
+     * В Apache POI BorderStyle: THICK = 5, но тут сравнение делалось "числом".
+     * Мы сохраняем логику и оставляем пороги константами.
+     */
+    private static final short BORDER_SECTION_SPLIT = 3;
+    private static final short BORDER_THICK = 5;
+
+    // ----------------------------
+    // Public API (совместимость)
+    // ----------------------------
+
+    public List<Teacher> getTeachers() {
+        // Геттеры не должны мутировать состояние.
+        // Поэтому возвращаем уже очищенную структуру (мы чистим в parse()).
+        return teachers;
     }
 
     public List<Group> getGroups() {
-        for(int i = 0; i < groups.size(); i++){
-            groups.get(i).getCommonLessons().removeIf(lesson -> lesson.getName().equals(""));
-            for(int j = 0; j < groups.get(i).getSubgroups().size(); j++){
-                groups.get(i).getSubgroups().get(j).getLessons().removeIf(lesson -> lesson.getName().equals(""));
-            }
-        }
         return groups;
     }
 
-    public List<Lesson> getLessons(){
+    public List<Lesson> getLessons() {
         return lessons;
     }
 
-    private  List<Cell> returnWorkspace(Workbook wb){
+    // ----------------------------
+    // Main entry
+    // ----------------------------
+
+    /**
+     * Парсинг Excel файла.
+     *
+     * synchronized: Parser singleton, внутреннее состояние меняется.
+     * Если хочешь масштабировать — лучше сделать парсер stateless и возвращать ParseResult,
+     * но это может потребовать правок в остальном проекте.
+     */
+    public synchronized void parse(File xlsFile, String facult) throws ParserException {
+        // Локальный контекст — безопаснее (не оставляем объект "полу-распарсенным" при исключениях)
+        ParseContext ctx = new ParseContext();
+
+        Workbook wb = readWorkbook(xlsFile);
+        ctx.formatter = new DataFormatter(Locale.ROOT);
+        ctx.evaluator = wb.getCreationHelper().createFormulaEvaluator();
+
+        List<Cell> workspace = buildWorkspace(wb, ctx);
+        if (workspace.isEmpty()) {
+            throw new ParserException("workspace is empty: unexpected table format or empty sheet");
+        }
+
+        ctx.lengthOfWorkspace = getLengthOfWorkspace(workspace);
+
+        // Стадии парсинга (как было)
+        ctx.parsMode = ParserStage.PARSER_STAGE_NAME_OF_GROUPS;
+
+        ctx.mapColumnToSubgroup = parseGroups(workspace, facult, ctx);
+        // После parseGroups() стадия должна стать SKIP (как раньше), иначе дальше не пойдём корректно.
+        // parseGroups() возвращает управление когда дошёл до границы.
+        if (ctx.parsMode != ParserStage.PARSER_STAGE_SKIP) {
+            // Нечастый случай, но лучше сообщить, чем молча сломаться.
+            throw new ParserException("table format exception: groups section was not fully parsed");
+        }
+
+        parseLessonsTeachersAuditoriums(workspace, ctx);
+
+        // Финальная очистка пустых "уроков" (сохраняем идею оригинала, но делаем один раз)
+        cleanupEmptyLessons(ctx);
+
+        // Публикуем результат атомарно
+        this.groups = ctx.groups;
+        this.teachers = ctx.teachers;
+        this.lessons = ctx.lessons;
+        this.parsMode = ctx.parsMode;
+    }
+
+    // ----------------------------
+    // Workspace building (Excel -> List<Cell>)
+    // ----------------------------
+
+    /**
+     * Собираем "рабочий набор" ячеек по критериям:
+     * - либо есть левая граница (borderLeft > 0),
+     * - либо колонка == 1 (по оригинальной логике).
+     *
+     * Далее фильтруем мусор:
+     * - строки шапки,
+     * - "курс", "№",
+     * - пустые в первых колонках.
+     */
+    private List<Cell> buildWorkspace(Workbook wb, ParseContext ctx) {
         List<Cell> cells = getAllCellsWhereBorderLeftExist(wb);
 
-        cells.removeIf(cell -> (cell.getStringCellValue().contains("курс") || cell.getStringCellValue().contains("№")) ||
-                (((cell.getColumnIndex() == 2 || cell.getColumnIndex() == 0 || cell.getColumnIndex() == 1)
-                        && cell.getStringCellValue().equals(""))) ||
-                cell.getRowIndex() < 12);
-
+        cells.removeIf(cell -> {
+            String v = cellString(cell, ctx);
+            // Исходные фильтры из твоего returnWorkspace()
+            boolean headerWords = v.contains("курс") || v.contains("№");
+            boolean emptyInFirstColumns = (cell.getColumnIndex() == 2 || cell.getColumnIndex() == 0 || cell.getColumnIndex() == 1) && v.isEmpty();
+            boolean beforeDataRow = cell.getRowIndex() < FIRST_DATA_ROW_INDEX;
+            return headerWords || emptyInFirstColumns || beforeDataRow;
+        });
 
         return cells;
     }
 
-    private  List<Cell> getAllCellsWhereBorderLeftExist(Workbook wb){
+    private List<Cell> getAllCellsWhereBorderLeftExist(Workbook wb) {
         Sheet st = wb.getSheetAt(0);
         List<Cell> cells = new ArrayList<>();
-        st.forEach(row->{
-            row.forEach(
-                    cell -> {
-                        try {
-                            cell.getStringCellValue();
-                            if (cell.getCellStyle().getBorderLeft() > 0)
-                                cells.add(cell);
-                            if(cell.getColumnIndex() == 1)
-                                cells.add(cell);
-                        }catch (IllegalStateException e){
-                            cell.setCellValue(String.valueOf((int)cell.getNumericCellValue()));
-                            cells.add(cell);
-                        }
 
-                    }
-            );
+        st.forEach(row -> row.forEach(cell -> {
+            // Никаких try/catch на IllegalStateException:
+            // - не трогаем значение cell.setCellValue(...)
+            // - тип ячейки читаем через DataFormatter позже
+            if (cell.getCellStyle() != null && cell.getCellStyle().getBorderLeft() > 0) {
+                cells.add(cell);
+            }
+            if (cell.getColumnIndex() == 1) {
+                cells.add(cell);
+            }
+        }));
 
-        });
         return cells;
     }
-    private void print(List<Cell> cells){
-        for(int l = 0; l < cells.size(); l++){
-            System.out.println(cells.get(l).getStringCellValue() + " | " + cells.get(l).getColumnIndex() + " | " + cells.get(l).getCellStyle().getBorderLeft());
-        }
-    }
 
-    private String[] splitTimeCellToArr(Cell cell){
-        List<String> arr = Arrays.stream(cell.getStringCellValue().split(" "))
-                .collect(Collectors.toList());
-        arr.removeIf(x -> x.equals(""));
-        return arr.get(arr.size() - 1).split("-");
-    }
+    // ----------------------------
+    // Groups parsing
+    // ----------------------------
 
-    private String parseStartTime(Cell cell){
-        return splitTimeCellToArr(cell)[0].replace("(","")
-                .replace(".",":");
-    }
+    /**
+     * Парсит блок групп/ID/подгрупп.
+     *
+     * Возвращает map: columnIndex -> Subgroup
+     *
+     * Важное улучшение:
+     * - защита от выхода за границы i+1
+     * - явные условия остановки вместо for(true)
+     */
+    private HashMap<Integer, Subgroup> parseGroups(List<Cell> workspace, String facult, ParseContext ctx) throws ParserException {
+        HashMap<Integer, Subgroup> map = new HashMap<>();
 
-    private String parseEndTime(Cell cell){
-        String[] arr = splitTimeCellToArr(cell);
-        return arr[arr.length - 1].replace(")","")
-                .replace(".",":");
-    }
-
-    private  HashMap<Integer,Subgroup> parseGroups(List<Cell> workspace, String facult) throws ParserException {
-        HashMap<Integer,Subgroup> map = new HashMap<>();
         Queue<Group> queue = new ArrayDeque<>();
         Queue<Group> queueCache = new ArrayDeque<>();
-        int count = 0;
-        for(int i = 0; true; i++) {
+        int groupCount = 0;
 
-            if (parsMode == ParserStage.PARSER_STAGE_NAME_OF_GROUPS) {
-                if (workspace.get(i + 1).getStringCellValue().equals("")) {
-                    throw new ParserException("table format Exception.");
+        int i = 0;
+        while (i < workspace.size()) {
+            Cell cur = workspace.get(i);
+            Cell next = safeGet(workspace, i + 1);
+
+            if (ctx.parsMode == ParserStage.PARSER_STAGE_NAME_OF_GROUPS) {
+                if (next == null) {
+                    throw new ParserException("table format exception: unexpected end while reading group names");
                 }
-                Group group = new Group().setName(workspace.get(i).getStringCellValue());
-                if(!(workspace.get(i+1).getColumnIndex() == 3 && workspace.get(i + 1).getCellStyle().getBorderLeft() == 5))
-                    group.setCountOfSubGroups(workspace.get(i+1).getColumnIndex() - workspace.get(i).getColumnIndex());
-                else
-                    group.setCountOfSubGroups(workspace.get(i).getColumnIndex() - workspace.get(i-1).getColumnIndex());
-                groups.add(group);
+
+                String groupName = cellString(cur, ctx);
+                String nextVal = cellString(next, ctx);
+
+                if (nextVal.isEmpty()) {
+                    throw new ParserException("table format exception: empty group header cell");
+                }
+
+                Group group = new Group().setName(groupName);
+
+                // Исходная логика определения числа подгрупп (очень завязано на layout Excel)
+                if (!(next.getColumnIndex() == FIRST_SCHEDULE_COLUMN_INDEX && borderLeft(next) == BORDER_THICK)) {
+                    group.setCountOfSubGroups(next.getColumnIndex() - cur.getColumnIndex());
+                } else {
+                    Cell prev = safeGet(workspace, i - 1);
+                    if (prev == null) {
+                        throw new ParserException("table format exception: cannot infer subgroups count (missing previous cell)");
+                    }
+                    group.setCountOfSubGroups(cur.getColumnIndex() - prev.getColumnIndex());
+                }
+
+                ctx.groups.add(group);
                 queue.add(group);
-                count++;
-                if(workspace.get(i+1).getColumnIndex() == 3 && workspace.get(i + 1).getCellStyle().getBorderLeft() == 5){
-                    parsMode = ParserStage.PARSER_STAGE_GROUPS_ID;
+                groupCount++;
+
+                // переход стадий как в оригинале
+                if (next.getColumnIndex() == FIRST_SCHEDULE_COLUMN_INDEX && borderLeft(next) == BORDER_THICK) {
+                    ctx.parsMode = ParserStage.PARSER_STAGE_GROUPS_ID;
                 }
+
+                i++;
                 continue;
             }
-            if (parsMode == ParserStage.PARSER_STAGE_GROUPS_ID) {
+
+            if (ctx.parsMode == ParserStage.PARSER_STAGE_GROUPS_ID) {
                 Group group = queue.poll();
-                if(group != null) {
+                if (group != null) {
                     queueCache.add(group);
-                    group.setId(workspace.get(i).getStringCellValue() + "/" + facult);
+                    // id = "что-то/факультет"
+                    group.setId(cellString(cur, ctx) + "/" + facult);
                 }
-                if(workspace.get(i+1).getColumnIndex() == 3 && workspace.get(i + 1).getCellStyle().getBorderLeft() > 3){
-                    for(int j = 0; j < count; j++)
-                        queue.add(queueCache.poll());
-                    parsMode = ParserStage.PARSER_STAGE_SUBGROUPS;
+
+                if (next != null
+                        && next.getColumnIndex() == FIRST_SCHEDULE_COLUMN_INDEX
+                        && borderLeft(next) > BORDER_SECTION_SPLIT) {
+
+                    // возвращаем группы обратно в очередь (как было)
+                    for (int j = 0; j < groupCount; j++) {
+                        Group g = queueCache.poll();
+                        if (g != null) queue.add(g);
+                    }
+                    ctx.parsMode = ParserStage.PARSER_STAGE_SUBGROUPS;
                 }
+
+                i++;
                 continue;
             }
-            if (parsMode == ParserStage.PARSER_STAGE_SUBGROUPS) {
+
+            if (ctx.parsMode == ParserStage.PARSER_STAGE_SUBGROUPS) {
                 Group group = queue.poll();
                 int lastIndex = 0;
-                if(group != null) {
+
+                if (group != null) {
                     for (int index = 0; index < group.getCountOfSubGroups(); index++) {
-                        Subgroup subgroup = new Subgroup().setId(workspace.get(i + index).getStringCellValue());
-                        map.put(workspace.get(i + index).getColumnIndex(), subgroup);
+                        Cell c = safeGet(workspace, i + index);
+                        if (c == null) {
+                            throw new ParserException("table format exception: unexpected end while reading subgroups");
+                        }
+                        String subgroupId = cellString(c, ctx);
+                        Subgroup subgroup = new Subgroup().setId(subgroupId);
+
+                        map.put(c.getColumnIndex(), subgroup);
                         group.addSubgroup(subgroup);
                         lastIndex = index;
                     }
                 }
-                if(workspace.get(i+1).getColumnIndex() == 0 && workspace.get(i + 1).getCellStyle().getBorderLeft() > 3){
-                    parsMode = ParserStage.PARSER_STAGE_SKIP;
+
+                if (next != null && next.getColumnIndex() == 0 && borderLeft(next) > BORDER_SECTION_SPLIT) {
+                    ctx.parsMode = ParserStage.PARSER_STAGE_SKIP;
                     return map;
                 }
-                i += lastIndex;
 
+                // пропускаем уже обработанные колонки подгрупп
+                i += (lastIndex + 1);
+                continue;
             }
+
+            // Если мы дошли сюда — формат неожиданный
+            throw new ParserException("table format exception: unexpected parser stage while parsing groups");
         }
 
+        throw new ParserException("table format exception: groups section not found/terminated");
     }
 
-    public void parse(File xlsFile , String facult) throws ParserException{
-        groups = new ArrayList<>();
-        teachers = new ArrayList<>();
-        Workbook wb = readWorkbook(xlsFile);
-        List<Cell> workspace = returnWorkspace(wb);
-        final int length = getLengthOfWorkspace(workspace);
-        parsMode = ParserStage.PARSER_STAGE_NAME_OF_GROUPS;
-        HashMap<Integer,Subgroup> map = parseGroups(workspace, facult);
+    // ----------------------------
+    // Lessons / Teachers / Auditoriums parsing
+    // ----------------------------
+
+    private void parseLessonsTeachersAuditoriums(List<Cell> workspace, ParseContext ctx) throws ParserException {
         String day = "";
         String date = "";
         String startTime = "";
         String endTime = "";
+
         Queue<Lesson> queueOfLessons = new ArrayDeque<>();
         Queue<Lesson> queueCache = new ArrayDeque<>();
         int countOfLessons = 0;
-        int skip = 0;
-        for(int i = 0; i < workspace.size() - 1 ; i++){
 
-            if (parsMode == ParserStage.PARSER_STAGE_SKIP) {
-                if(workspace.get(i + 1).getCellStyle().getBorderLeft() > 3) {
-                    skip++;
-                    if(skip == 3) {
-                        parsMode = ParserStage.PARSER_STAGE_DAY;
+        int skipBorders = 0;
+
+        // Преподавателей лучше дедуплицировать: иначе будет тысячи одинаковых объектов
+        Map<String, Teacher> teacherIndex = new HashMap<>();
+
+        // (Опционально) ускоряем поиск группы по id подгруппы
+        Map<String, Group> subgroupIdToGroup = indexSubgroupToGroup(ctx.groups);
+
+        for (int i = 0; i < workspace.size() - 1; i++) {
+            Cell cur = workspace.get(i);
+            Cell next = safeGet(workspace, i + 1);
+
+            if (ctx.parsMode == ParserStage.PARSER_STAGE_SKIP) {
+                if (next != null && borderLeft(next) > BORDER_SECTION_SPLIT) {
+                    skipBorders++;
+                    if (skipBorders == 3) {
+                        ctx.parsMode = ParserStage.PARSER_STAGE_DAY;
                         continue;
                     }
-                } else
-                    continue;
-
-            }
-            if(workspace.get(i).getColumnIndex() == 2 && workspace.get(i).getCellStyle().getBorderLeft() >3){
-                parsMode = ParserStage.PARSER_STAGE_TIME;
+                }
+                continue;
             }
 
-            if(parsMode == ParserStage.PARSER_STAGE_DAY){
-                day = workspace.get(i).getStringCellValue();
-                parsMode = ParserStage.PARSER_STAGE_DATE;
+            // В оригинале переход в TIME происходил при columnIndex==2 и borderLeft > 3.
+            if (cur.getColumnIndex() == 2 && borderLeft(cur) > BORDER_SECTION_SPLIT) {
+                ctx.parsMode = ParserStage.PARSER_STAGE_TIME;
+            }
+
+            if (ctx.parsMode == ParserStage.PARSER_STAGE_DAY) {
+                day = cellString(cur, ctx);
+                ctx.parsMode = ParserStage.PARSER_STAGE_DATE;
                 continue;
             }
-            if(parsMode == ParserStage.PARSER_STAGE_TIME){
-                startTime = parseStartTime(workspace.get(i));
-                endTime = parseEndTime(workspace.get(i));
-                parsMode = ParserStage.PARSER_STAGE_LESSONS;
+
+            if (ctx.parsMode == ParserStage.PARSER_STAGE_DATE) {
+                date = cellString(cur, ctx);
+                ctx.parsMode = ParserStage.PARSER_STAGE_TIME;
                 continue;
             }
-            if(parsMode == ParserStage.PARSER_STAGE_DATE){
-                date = workspace.get(i).getStringCellValue();
-                parsMode = ParserStage.PARSER_STAGE_TIME;
+
+            if (ctx.parsMode == ParserStage.PARSER_STAGE_TIME) {
+                // Время ожидается как строка, содержащая "... (HH.MM-HH.MM)" и т.п.
+                // Мы сохраняем исходную стратегию split(), но безопаснее обрабатываем пустые/кривые ячейки.
+                startTime = parseStartTime(cur, ctx);
+                endTime = parseEndTime(cur, ctx);
+                ctx.parsMode = ParserStage.PARSER_STAGE_LESSONS;
                 continue;
             }
-            if(parsMode == ParserStage.PARSER_STAGE_LESSONS ) {
-                Lesson lesson = parseLesson(workspace.get(i));
-                lesson .setDate(date)
+
+            if (ctx.parsMode == ParserStage.PARSER_STAGE_LESSONS) {
+                Lesson lesson = parseLesson(cur, ctx);
+                lesson.setDate(date)
                         .setWeekDay(day)
                         .setStartTime(startTime)
                         .setEndTime(endTime)
                         .setId(UUID.randomUUID());
-                lessons.add(lesson);
+
+                ctx.lessons.add(lesson);
                 queueOfLessons.add(lesson);
                 countOfLessons++;
-                if ((isAdjacentColumns(workspace.get(i),workspace.get(i + 1)) ||
-                        isPenultimateColumnAndTheNextIsTheFirst(workspace.get(i),workspace.get(i+1),length)) ||
-                        isSingleColumnInTheRow(workspace.get(i),workspace.get(i+1))) {
 
-                    int firstColumnIndex = workspace.get(i).getColumnIndex();
-                    int secondColumnIndex = workspace.get(i + 1).getColumnIndex();
-                    if(firstColumnIndex == 3 && secondColumnIndex == 3){
-                        secondColumnIndex = length + 3;
+                // Раскладка таблицы: если между колонками "прыжок", значит lesson общий на несколько подгрупп
+                // (в оригинале метод назывался isAdjacentColumns, но логика была "gap >= 2" — оставляем, но комментируем).
+                if (next != null && (isAdjacentColumns(cur, next)
+                        || isPenultimateColumnAndTheNextIsTheFirst(cur, next, ctx.lengthOfWorkspace)
+                        || isSingleColumnInTheRow(cur, next))) {
+
+                    int firstColumnIndex = cur.getColumnIndex();
+                    int secondColumnIndex = next.getColumnIndex();
+
+                    // Частный костыль из оригинала: "3 и 3" интерпретируется как конец строки
+                    if (firstColumnIndex == FIRST_SCHEDULE_COLUMN_INDEX && secondColumnIndex == FIRST_SCHEDULE_COLUMN_INDEX) {
+                        secondColumnIndex = ctx.lengthOfWorkspace + FIRST_SCHEDULE_COLUMN_INDEX;
                     }
-                    for(int j = firstColumnIndex; j < secondColumnIndex; j++) {
-                        Optional<Group> opt_group = findGroupBySubgroupIndex(map.get(j).getId());
-                        if (opt_group.isPresent()) {
-                            Group group = opt_group.get();
-                            if (isThisLessonInGroup(lesson, group)) {
-                                continue;
-                            }
+
+                    for (int col = firstColumnIndex; col < secondColumnIndex; col++) {
+                        Subgroup sg = ctx.mapColumnToSubgroup.get(col);
+                        if (sg == null) {
+                            throw new ParserException("table format exception: subgroup not found for column " + col);
+                        }
+
+                        Group group = subgroupIdToGroup.get(sg.getId());
+                        if (group == null) {
+                            // fallback на старый O(n^2), если индекс не сработал (на всякий)
+                            Optional<Group> opt = findGroupBySubgroupIndex(sg.getId(), ctx.groups);
+                            if (opt.isPresent()) group = opt.get();
+                        }
+                        if (group == null) {
+                            throw new ParserException("table format exception: group not found for subgroup " + sg.getId());
+                        }
+
+                        if (!isThisLessonInGroup(lesson, group)) {
                             group.addLesson(lesson);
-                        } else
-                            throw new ParserException("table format exception");
-                    }
-
-                } else {
-                    try {
-                        map.get(workspace.get(i).getColumnIndex()).addLesson(lesson);
-                    } catch(NullPointerException e){
-                            System.out.println(workspace.get(i).getStringCellValue());
                         }
+                    }
+                } else {
+                    // Урок относится к конкретной подгруппе
+                    Subgroup sg = ctx.mapColumnToSubgroup.get(cur.getColumnIndex());
+                    if (sg == null) {
+                        // В оригинале был NPE + println. Тут лучше дать сигнал формата.
+                        log.warn("No subgroup mapping for column {} (cell='{}')", cur.getColumnIndex(), cellString(cur, ctx));
+                    } else {
+                        sg.addLesson(lesson);
+                    }
                 }
-                if(workspace.get(i + 1).getColumnIndex() == 3){
-                    parsMode = ParserStage.PARSER_STAGE_TEACHERS;
-                    continue;
-                }
-            }if(parsMode == ParserStage.PARSER_STAGE_TEACHERS){
-                Lesson lesson = queueOfLessons.poll();
-                if(lesson != null) {
-                    queueCache.add(lesson);
-                    if (!workspace.get(i).getStringCellValue().equals("")) {
-                        if (!workspace.get(i).getStringCellValue().contains(",")) {
-                            Teacher teacher = parseTeacher(workspace.get(i).getStringCellValue());
-                            teachers.add(teacher);
-                            teacher.addLesson(lesson);
-                        } else {
-                            for (String teacherString : splitManyTeachersToList(workspace.get(i))) {
-                                Teacher teacher = parseTeacher(teacherString);
 
-                                teacher.addLesson(lesson);
+                // Переход к блоку преподавателей
+                if (next != null && next.getColumnIndex() == FIRST_SCHEDULE_COLUMN_INDEX) {
+                    ctx.parsMode = ParserStage.PARSER_STAGE_TEACHERS;
+                }
+                continue;
+            }
+
+            if (ctx.parsMode == ParserStage.PARSER_STAGE_TEACHERS) {
+                Lesson lesson = queueOfLessons.poll();
+                if (lesson != null) {
+                    queueCache.add(lesson);
+
+                    String teacherCell = cellString(cur, ctx);
+                    if (!teacherCell.isEmpty()) {
+                        if (!teacherCell.contains(",")) {
+                            Teacher t = getOrCreateTeacher(teacherCell, teacherIndex);
+                            t.addLesson(lesson);
+                        } else {
+                            for (String teacherString : splitManyTeachersToList(teacherCell)) {
+                                if (teacherString.isBlank()) continue;
+                                Teacher t = getOrCreateTeacher(teacherString, teacherIndex);
+                                t.addLesson(lesson);
                             }
                         }
                     }
+                }
 
-                }
-                if(workspace.get(i + 1).getColumnIndex() == 3){
-                    parsMode = ParserStage.PARSER_STAGE_AUDITORIUMS;
-                    for(int j = 0; j < countOfLessons  ; j++){
-                        if(queueCache.peek() != null)
-                            queueOfLessons.add(queueCache.poll());
-                        else
-                            break;
+                // Переход к аудиториям + восстановление очереди уроков
+                if (next != null && next.getColumnIndex() == FIRST_SCHEDULE_COLUMN_INDEX) {
+                    ctx.parsMode = ParserStage.PARSER_STAGE_AUDITORIUMS;
+
+                    for (int j = 0; j < countOfLessons; j++) {
+                        Lesson l = queueCache.poll();
+                        if (l != null) queueOfLessons.add(l);
+                        else break;
                     }
-                    continue;
                 }
-            }if(parsMode == ParserStage.PARSER_STAGE_AUDITORIUMS){
+                continue;
+            }
+
+            if (ctx.parsMode == ParserStage.PARSER_STAGE_AUDITORIUMS) {
                 Lesson lesson = queueOfLessons.poll();
-                if(lesson == null) {
-                    if(workspace.get(i+1).getCellStyle().getBorderLeft() == 5 && workspace.get(i + 1).getColumnIndex() == 0 ) {
-                        parsMode = ParserStage.PARSER_STAGE_DAY;
+
+                if (lesson == null) {
+                    // Конец блока аудитории: если следующая ячейка — "разделитель дня", возвращаемся к DAY
+                    if (next != null && borderLeft(next) == BORDER_THICK && next.getColumnIndex() == 0) {
+                        ctx.parsMode = ParserStage.PARSER_STAGE_DAY;
                     }
                     countOfLessons = 0;
                     continue;
-                };
-                lesson.setAuditorium(workspace.get(i).getStringCellValue());
-            }
+                }
 
+                lesson.setAuditorium(cellString(cur, ctx));
+            }
         }
+
+        // Добавляем всех уникальных преподавателей в ctx.teachers (в конце, чтобы список был чистый)
+        ctx.teachers.addAll(teacherIndex.values());
     }
 
-    private Teacher parseTeacher(String s){
+    // ----------------------------
+    // Teacher parsing / indexing
+    // ----------------------------
+
+    /**
+     * Получает существующего преподавателя или создаёт нового.
+     * Ключ должен быть стабильным: "Фамилия|Инициалы|Квалификация".
+     */
+    private Teacher getOrCreateTeacher(String raw, Map<String, Teacher> index) {
+        Teacher t = parseTeacher(raw);
+        String key = teacherKey(t);
+        return index.computeIfAbsent(key, k -> t);
+    }
+
+    private String teacherKey(Teacher t) {
+        // trim + lower для унификации (иначе будут дубли из-за пробелов/регистра)
+        return (safe(t.getLastname()) + "|" + safe(t.getInitials()) + "|" + safe(t.getQualification())).toLowerCase(Locale.ROOT).trim();
+    }
+
+    private String safe(String s) {
+        return s == null ? "" : s.trim();
+    }
+
+    private Teacher parseTeacher(String s) {
+        s = s.trim();
         String teacherLastName = parseTeacherLastname(s);
         String teacherInitials = parseTeacherInitials(s);
         String teacherQualification = parseTeacherQualification(s);
+
         return new Teacher()
-                        .setLastname(teacherLastName)
-                        .setQualification(teacherQualification)
-                        .setInitials(teacherInitials);
-
-
+                .setLastname(teacherLastName)
+                .setQualification(teacherQualification)
+                .setInitials(teacherInitials);
     }
 
+    private List<String> splitManyTeachersToList(String cellValue) {
+        return Arrays.stream(cellValue.split(","))
+                .map(String::trim)
+                .collect(Collectors.toList());
+    }
 
-    private Lesson parseLesson(Cell cell){
-        String lessonName = parseLessonName(cell);
-        String lessonType = parseLessonType(cell);
+    private String[] splitTeacherStringToArr(String s) {
+        // Убираем повторные пробелы — иначе arr[1] может упасть
+        return Arrays.stream(s.trim().split("\\s+"))
+                .filter(x -> !x.isBlank())
+                .toArray(String[]::new);
+    }
+
+    private String parseTeacherLastname(String s) {
+        String[] arr = splitTeacherStringToArr(s);
+        return arr.length > 0 ? arr[0] : "";
+    }
+
+    private String parseTeacherQualification(String s) {
+        String[] arr = splitTeacherStringToArr(s);
+        if (arr.length == 0) return "";
+        return arr[arr.length - 1].replace("(", "").replace(")", "");
+    }
+
+    private String parseTeacherInitials(String s) {
+        String[] arr = splitTeacherStringToArr(s);
+        return arr.length > 1 ? arr[1] : "";
+    }
+
+    // ----------------------------
+    // Lesson parsing
+    // ----------------------------
+
+    private Lesson parseLesson(Cell cell, ParseContext ctx) {
+        String lessonName = parseLessonName(cell, ctx);
+        String lessonType = parseLessonType(cell, ctx);
         return new Lesson()
                 .setName(lessonName)
                 .setType(lessonType);
     }
-    private List<String> splitManyTeachersToList(Cell cell){
-        return Arrays.stream(cell.getStringCellValue().split(",")).toList();
+
+    private String parseLessonName(Cell cell, ParseContext ctx) {
+        String v = cellString(cell, ctx);
+
+        // Убираем маркеры типа "(лк)" "(пз)" "(лаб)" — но не режем любые скобки в названии предмета.
+        // Это менее разрушительно, чем оригинальная логика "всё со скобками выкинуть".
+        String cleaned = v
+                .replace("(лк)", "")
+                .replace("(пз)", "")
+                .replace("(лаб)", "");
+
+        // нормализуем пробелы
+        cleaned = cleaned.replaceAll("\\s+", " ").trim();
+
+        return cleaned;
     }
 
-    private String[] splitTeacherStringToArr(String s){
-        return s.split(" ");
-
+    private String parseLessonType(Cell cell, ParseContext ctx) {
+        String v = cellString(cell, ctx);
+        if (v.contains("(лк)")) return "лк";
+        if (v.contains("(пз)")) return "пз";
+        if (v.contains("(лаб)")) return "лаб";
+        return "";
     }
 
-    private String parseTeacherLastname(String s){
-        String[] arr = splitTeacherStringToArr(s);
-        return arr[0];
+    // ----------------------------
+    // Time parsing
+    // ----------------------------
+
+    private String parseStartTime(Cell cell, ParseContext ctx) throws ParserException {
+        String[] arr = splitTimeCellToArr(cell, ctx);
+        if (arr.length == 0) throw new ParserException("time format exception: cannot parse start time");
+        return arr[0].replace("(", "").replace(".", ":").trim();
     }
 
-    private String parseTeacherQualification(String s){
-        String[] arr = splitTeacherStringToArr(s);
-        return arr[arr.length - 1].replace("(","").replace(")","");
+    private String parseEndTime(Cell cell, ParseContext ctx) throws ParserException {
+        String[] arr = splitTimeCellToArr(cell, ctx);
+        if (arr.length == 0) throw new ParserException("time format exception: cannot parse end time");
+        return arr[arr.length - 1].replace(")", "").replace(".", ":").trim();
     }
 
-    private String parseTeacherInitials(String s){
-        String[] arr = splitTeacherStringToArr(s);
-        return arr[1];
-    }
-
-
-
-    private boolean isSingleColumnInTheRow(Cell cell, Cell nextCell){
-        return (nextCell.getColumnIndex() == 3  && cell.getColumnIndex() == 3);
-    }
-
-    private boolean isAdjacentColumns(Cell cell, Cell nextCell){
-        return (nextCell.getColumnIndex() - cell.getColumnIndex()) >= 2;
-
-    }
-    private boolean isPenultimateColumnAndTheNextIsTheFirst(Cell cell, Cell nextCell, int lengthOfWorkSpace){
-        return ((cell.getColumnIndex() == lengthOfWorkSpace  + 1) && nextCell.getColumnIndex() == 3);
-    }
-    private String parseLessonName(Cell cell){
-        List<String> lessonNameArr = Arrays.stream(cell.getStringCellValue().split(" "))
-                .filter(x -> !(x.contains("(") && x.contains(")"))).collect(Collectors.toList());
-        String lessonName = "";
-        for(String word : lessonNameArr ){
-            if(!word.equals(""))
-                lessonName += word + " ";
+    /**
+     * Оригинальная логика:
+     * - split по пробелам, убрать пустые
+     * - взять последний токен и split по "-"
+     *
+     * Мы добавили:
+     * - защиту от пустых значений
+     * - нормализацию пробелов
+     */
+    private String[] splitTimeCellToArr(Cell cell, ParseContext ctx) throws ParserException {
+        String v = cellString(cell, ctx).trim();
+        if (v.isEmpty()) {
+            throw new ParserException("time format exception: empty time cell");
         }
-        return lessonName;
-    }
 
-    private String parseLessonType(Cell cell){
-        String cellValue = cell.getStringCellValue();
-        String type = "";
-        if(cellValue.contains("(лк)"))
-            type = "лк";
-        if(cellValue.contains("(пз)"))
-            type = "пз";
-        if(cellValue.contains("(лаб)"))
-            type = "лаб";
-        return type;
-    }
+        List<String> arr = Arrays.stream(v.split("\\s+"))
+                .filter(x -> !x.isBlank())
+                .collect(Collectors.toList());
 
-    private boolean isThisLessonInGroup(Lesson lesson, Group group){
-        for(Lesson groupLesson : group.getCommonLessons()){
-            if(groupLesson.getStartTime().equals(lesson.getStartTime()) && groupLesson.getDate().equals(lesson.getDate())){
-                return true;
-            }
+        if (arr.isEmpty()) {
+            throw new ParserException("time format exception: cannot split time cell");
         }
-        return false;
 
+        String last = arr.get(arr.size() - 1);
+        String[] range = last.split("-");
+        if (range.length == 0) {
+            throw new ParserException("time format exception: cannot parse time range");
+        }
+        return range;
     }
 
-    public Workbook readWorkbook(File file) throws ParserException{
+    // ----------------------------
+    // Workbook reading
+    // ----------------------------
+
+    public Workbook readWorkbook(File file) throws ParserException {
         try {
-            Workbook wb = WorkbookFactory.create(file);
-            return wb;
-        }
-        catch (Exception e) {
+            return WorkbookFactory.create(file);
+        } catch (Exception e) {
             throw new ParserException("cannot read workbook");
-
-
         }
     }
 
+    // ----------------------------
+    // Helpers: group lookup, dedup, cleanup
+    // ----------------------------
 
-    private Optional<Group> findGroupBySubgroupIndex(String index){
-        for(int i = 0; i < groups.size(); i++ ){
-            for(int j = 0; j < groups.get(i).getSubgroups().size(); j++ ){
-                if(groups.get(i).getSubgroups().get(j).getId().equals(index)){
-                    return Optional.of(groups.get(i));
+    private Optional<Group> findGroupBySubgroupIndex(String index, List<Group> groups) {
+        for (Group g : groups) {
+            for (Subgroup sg : g.getSubgroups()) {
+                if (Objects.equals(sg.getId(), index)) {
+                    return Optional.of(g);
                 }
             }
-
         }
         return Optional.empty();
     }
 
-    private int getLengthOfWorkspace(List<Cell> cells){ // only after returnWorkspace()
-        int length = 0;
-        for(int i = 1; true; i++) {
-            if (cells.get(i).getCellStyle().getBorderLeft() >= 3)
-                break;
-            length++;
+    private Map<String, Group> indexSubgroupToGroup(List<Group> groups) {
+        Map<String, Group> map = new HashMap<>();
+        for (Group g : groups) {
+            for (Subgroup sg : g.getSubgroups()) {
+                if (sg.getId() != null) map.put(sg.getId(), g);
+            }
         }
-        return (length +1)* 2;
+        return map;
     }
 
+    private boolean isThisLessonInGroup(Lesson lesson, Group group) {
+        // Оставляем оригинальную семантику: совпали startTime + date => урок "общий", второй не добавляем.
+        for (Lesson groupLesson : group.getCommonLessons()) {
+            if (Objects.equals(groupLesson.getStartTime(), lesson.getStartTime())
+                    && Objects.equals(groupLesson.getDate(), lesson.getDate())) {
+                return true;
+            }
+        }
+        return false;
+    }
 
+    /**
+     * Финальная очистка пустых уроков — один раз, не в геттерах.
+     */
+    private void cleanupEmptyLessons(ParseContext ctx) {
+        // teachers lessons
+        for (Teacher t : ctx.teachers) {
+            if (t.getLessons() != null) {
+                t.getLessons().removeIf(l -> l == null || safe(l.getName()).isEmpty());
+            }
+        }
+
+        // groups lessons + subgroups lessons
+        for (Group g : ctx.groups) {
+            if (g.getCommonLessons() != null) {
+                g.getCommonLessons().removeIf(l -> l == null || safe(l.getName()).isEmpty());
+            }
+            if (g.getSubgroups() != null) {
+                for (Subgroup sg : g.getSubgroups()) {
+                    if (sg.getLessons() != null) {
+                        sg.getLessons().removeIf(l -> l == null || safe(l.getName()).isEmpty());
+                    }
+                }
+            }
+        }
+
+        // global lessons
+        ctx.lessons.removeIf(l -> l == null || safe(l.getName()).isEmpty());
+    }
+
+    // ----------------------------
+    // Layout heuristics (оставлены, но прокомментированы)
+    // ----------------------------
+
+    private boolean isSingleColumnInTheRow(Cell cell, Cell nextCell) {
+        return (nextCell.getColumnIndex() == FIRST_SCHEDULE_COLUMN_INDEX && cell.getColumnIndex() == FIRST_SCHEDULE_COLUMN_INDEX);
+    }
+
+    /**
+     * Название из оригинала не отражает реальность:
+     * тут считается, что между колонками есть "разрыв" (>=2), значит lesson относится к диапазону.
+     * Оставили для совместимости поведения.
+     */
+    private boolean isAdjacentColumns(Cell cell, Cell nextCell) {
+        return (nextCell.getColumnIndex() - cell.getColumnIndex()) >= 2;
+    }
+
+    private boolean isPenultimateColumnAndTheNextIsTheFirst(Cell cell, Cell nextCell, int lengthOfWorkSpace) {
+        return ((cell.getColumnIndex() == lengthOfWorkSpace + 1) && nextCell.getColumnIndex() == FIRST_SCHEDULE_COLUMN_INDEX);
+    }
+
+    private int getLengthOfWorkspace(List<Cell> cells) throws ParserException {
+        // Оригинальная логика: идём от i=1 до "границы" (borderLeft >= 3)
+        // и потом делаем странную формулу (length+1)*2.
+        // Сохраняем, но добавляем защиту.
+        int length = 0;
+
+        for (int i = 1; i < cells.size(); i++) {
+            if (borderLeft(cells.get(i)) >= BORDER_SECTION_SPLIT) {
+                break;
+            }
+            length++;
+        }
+
+        if (length == 0) {
+            throw new ParserException("table format exception: cannot determine workspace length");
+        }
+
+        return (length + 1) * 2;
+    }
+
+    // ----------------------------
+    // Low-level helpers
+    // ----------------------------
+
+    private Cell safeGet(List<Cell> list, int idx) {
+        if (idx < 0 || idx >= list.size()) return null;
+        return list.get(idx);
+    }
+
+    private short borderLeft(Cell cell) {
+        if (cell == null || cell.getCellStyle() == null) return 0;
+        return cell.getCellStyle().getBorderLeft();
+    }
+
+    /**
+     * Унифицированное чтение значения ячейки:
+     * - корректно для строк/чисел/формул
+     * - не мутирует workbook/ячейку
+     */
+    private String cellString(Cell cell, ParseContext ctx) {
+        if (cell == null) return "";
+        try {
+            String s = ctx.formatter.formatCellValue(cell, ctx.evaluator);
+            return s == null ? "" : s.trim();
+        } catch (Exception e) {
+            // Не валимся из-за одной кривой ячейки — лучше пустую строку и лог.
+            log.debug("Failed to format cell [r={}, c={}]: {}", cell.getRowIndex(), cell.getColumnIndex(), e.getMessage());
+            return "";
+        }
+    }
+
+    // ----------------------------
+    // Parse context (внутренний объект состояния)
+    // ----------------------------
+
+    private static class ParseContext {
+        ParserStage parsMode;
+
+        List<Teacher> teachers = new ArrayList<>();
+        List<Group> groups = new ArrayList<>();
+        List<Lesson> lessons = new ArrayList<>();
+
+        HashMap<Integer, Subgroup> mapColumnToSubgroup = new HashMap<>();
+        int lengthOfWorkspace = 0;
+
+        DataFormatter formatter;
+        FormulaEvaluator evaluator;
+    }
 }
