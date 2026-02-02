@@ -25,12 +25,4 @@ public class AdminController {
     public String getRoot(Authentication authentication){
         return "redirect:/schedule/admin";
     }
-
-    @GetMapping("/logout")
-    public String logout(HttpServletRequest request) throws ServletException {
-        request.logout();
-        String keycloakLogoutUrl = "http://localhost:8080/realms/vsu-realm/protocol/openid-connect/logout";
-        String redirectUri = "http://localhost:9898/";
-        return "redirect:" + keycloakLogoutUrl + "?post_logout_redirect_uri=" + redirectUri + "&client_id=schedule-service";
-    }
 }
